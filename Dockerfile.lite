@@ -1,0 +1,107 @@
+# Lite version (size-optimized) while keeping runtime functionality
+# Notes:
+# - Keeps locale files to preserve multi-language output
+# - Removes docs/man/info and apt lists
+# - Avoids copying build-time static libraries into the final image
+# - Optionally strips symbols from .so to reduce size (at the cost of debug symbols)
+
+# First stage: Build extensions
+FROM postgres:17.6 AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Make cargo available in subsequent layers
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install required packages for building PostgreSQL extensions
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        bison \
+        flex \
+        llvm \
+        git \
+        curl \
+        ca-certificates \
+        xz-utils \
+        libreadline-dev \
+        zlib1g-dev \
+        postgresql-server-dev-17 \
+        libpq-dev \
+        pkg-config \
+    ; \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Rust and Cargo
+RUN set -eux; \
+    curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+
+# Install specific version of pgrx
+RUN set -eux; \
+    export PATH="$HOME/.cargo/bin:$PATH"; \
+    cargo install cargo-pgrx --version=0.16.0; \
+    cargo pgrx init --pg17 /usr/bin/pg_config
+
+# Build pg_parquet
+RUN set -eux; \
+    git clone --depth 1 https://github.com/CrunchyData/pg_parquet.git /tmp/pg_parquet; \
+    cd /tmp/pg_parquet; \
+    export PATH="$HOME/.cargo/bin:$PATH"; \
+    cargo pgrx install --release; \
+    rm -rf /tmp/pg_parquet
+
+# Copy only runtime-required pg_parquet artifacts
+RUN set -eux; \
+    mkdir -p /artifacts/extension; \
+    mkdir -p /artifacts/lib; \
+    cp /usr/share/postgresql/17/extension/pg_parquet* /artifacts/extension/; \
+    cp /usr/lib/postgresql/17/lib/pg_parquet.so /artifacts/lib/
+
+
+# Second stage: Final PostgreSQL image
+FROM postgres:17.6
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        postgresql-17-age \
+        postgresql-17-cron \
+        postgresql-17-jsquery \
+        postgresql-17-partman \
+        postgresql-17-pg-hint-plan \
+        postgresql-17-pgaudit \
+        postgresql-17-pgauditlogtofile \
+        postgresql-17-pgpcre \
+        postgresql-17-pgq3 \
+        postgresql-17-pgvector \
+        postgresql-17-prefix \
+        postgresql-17-timescaledb \
+    ; \
+    apt-get autoremove -y; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*; \
+    rm -rf /usr/share/doc /usr/share/man /usr/share/info
+
+# Copy built extensions from builder stage
+COPY --from=builder /artifacts/lib/* /usr/lib/postgresql/17/lib/
+COPY --from=builder /artifacts/extension/* /usr/share/postgresql/17/extension/
+
+# Optional: strip symbols to reduce shared library size (keeps runtime functionality)
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends binutils; \
+    strip --strip-unneeded /usr/lib/postgresql/17/lib/*.so || true; \
+    apt-get purge -y --auto-remove binutils; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD pg_isready -U postgres || exit 1
+
+# Set default command
+CMD ["postgres"]
